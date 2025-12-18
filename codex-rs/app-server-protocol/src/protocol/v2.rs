@@ -1270,6 +1270,8 @@ pub struct Turn {
 pub struct TurnError {
     pub message: String,
     pub codex_error_info: Option<CodexErrorInfo>,
+    #[serde(default)]
+    pub cause_message: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, JsonSchema, TS)]
