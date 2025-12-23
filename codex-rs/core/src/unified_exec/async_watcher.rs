@@ -10,6 +10,7 @@ use tokio::time::Sleep;
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::exec::ExecToolCallOutput;
+use crate::exec::MAX_EXEC_OUTPUT_DELTAS_PER_CALL;
 use crate::exec::StreamOutput;
 use crate::protocol::EventMsg;
 use crate::protocol::ExecCommandOutputDeltaEvent;
@@ -24,6 +25,14 @@ use super::UnifiedExecContext;
 use super::session::UnifiedExecSession;
 
 pub(crate) const TRAILING_OUTPUT_GRACE: Duration = Duration::from_millis(100);
+
+/// Upper bound for a single ExecCommandOutputDelta chunk emitted by unified exec.
+///
+/// The unified exec output buffer already caps *retained* output (see
+/// `UNIFIED_EXEC_OUTPUT_MAX_BYTES`), but we also cap per-event payload size so
+/// downstream event consumers (especially app-server JSON-RPC) don't have to
+/// process arbitrarily large delta payloads.
+const UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES: usize = 8192;
 
 /// Spawn a background task that continuously reads from the PTY, appends to the
 /// shared transcript, and emits ExecCommandOutputDelta events on UTF‑8
@@ -45,6 +54,7 @@ pub(crate) fn start_streaming_output(
         use tokio::sync::broadcast::error::RecvError;
 
         let mut pending = Vec::<u8>::new();
+        let mut emitted_deltas: usize = 0;
 
         let mut grace_sleep: Option<Pin<Box<Sleep>>> = None;
 
@@ -82,6 +92,7 @@ pub(crate) fn start_streaming_output(
                         &call_id,
                         &session_ref,
                         &turn_ref,
+                        &mut emitted_deltas,
                         chunk,
                     ).await;
                 }
@@ -135,13 +146,18 @@ async fn process_chunk(
     call_id: &str,
     session_ref: &Arc<Session>,
     turn_ref: &Arc<TurnContext>,
+    emitted_deltas: &mut usize,
     chunk: Vec<u8>,
 ) {
     pending.extend_from_slice(&chunk);
-    while let Some(prefix) = split_valid_utf8_prefix(pending) {
+    while let Some(prefix) = split_valid_utf8_prefix(pending, UNIFIED_EXEC_OUTPUT_DELTA_MAX_BYTES) {
         {
             let mut guard = transcript.lock().await;
             guard.append(&prefix);
+        }
+
+        if *emitted_deltas >= MAX_EXEC_OUTPUT_DELTAS_PER_CALL {
+            continue;
         }
 
         let event = ExecCommandOutputDeltaEvent {
@@ -152,6 +168,7 @@ async fn process_chunk(
         session_ref
             .send_event(turn_ref.as_ref(), EventMsg::ExecCommandOutputDelta(event))
             .await;
+        *emitted_deltas += 1;
     }
 }
 
@@ -192,13 +209,13 @@ pub(crate) async fn emit_exec_end_for_unified_exec(
         .await;
 }
 
-fn split_valid_utf8_prefix(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+fn split_valid_utf8_prefix(buffer: &mut Vec<u8>, max_bytes: usize) -> Option<Vec<u8>> {
     if buffer.is_empty() {
         return None;
     }
 
-    let len = buffer.len();
-    let mut split = len;
+    let max_len = buffer.len().min(max_bytes);
+    let mut split = max_len;
     while split > 0 {
         if std::str::from_utf8(&buffer[..split]).is_ok() {
             let prefix = buffer[..split].to_vec();
@@ -206,7 +223,7 @@ fn split_valid_utf8_prefix(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
             return Some(prefix);
         }
 
-        if len - split > 4 {
+        if max_len - split > 4 {
             break;
         }
         split -= 1;
